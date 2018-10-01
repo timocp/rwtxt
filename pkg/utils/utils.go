@@ -25,7 +25,8 @@ func RenderMarkdownToHTML(markdown string) template.HTML {
 				blackfriday.Tables|
 				blackfriday.FencedCode|
 				blackfriday.AutoHeadingIDs|
-				blackfriday.Footnotes),
+				blackfriday.Footnotes|
+				blackfriday.HardLineBreak),
 	))
 
 	p := bluemonday.UGCPolicy()
