@@ -24,34 +24,35 @@ const introText = "This note is empty. Click to edit it."
 var languageCSS map[string]string
 
 type TemplateRender struct {
-	Title             string
-	Page              string
-	Rendered          template.HTML
-	File              db.File
-	IntroText         template.JS
-	Rows              int
-	RandomUUID        string
-	Domain            string
-	DomainID          int
-	DomainKey         string
-	DomainIsPrivate   bool
-	DomainValue       template.HTMLAttr
-	DomainList        []string
-	DomainKeys        map[string]string
-	DefaultDomain     string
-	SignedIn          bool
-	Message           string
-	NumResults        int
-	Files             []db.File
-	MostActiveList    []db.File
-	SimilarFiles      []db.File
-	Search            string
-	DomainExists      bool
-	ShowCookieMessage bool
-	EditOnly          bool
-	Languages         []string
-	LanguageJS        []template.JS
-	rwt               *RWTxt
+	Title              string
+	Page               string
+	Rendered           template.HTML
+	File               db.File
+	IntroText          template.JS
+	Rows               int
+	RandomUUID         string
+	Domain             string
+	DomainID           int
+	DomainKey          string
+	DomainIsPrivate    bool
+	PrivateEnvironment bool
+	DomainValue        template.HTMLAttr
+	DomainList         []string
+	DomainKeys         map[string]string
+	DefaultDomain      string
+	SignedIn           bool
+	Message            string
+	NumResults         int
+	Files              []db.File
+	MostActiveList     []db.File
+	SimilarFiles       []db.File
+	Search             string
+	DomainExists       bool
+	ShowCookieMessage  bool
+	EditOnly           bool
+	Languages          []string
+	LanguageJS         []template.JS
+	rwt                *RWTxt
 }
 
 type Payload struct {
@@ -199,7 +200,8 @@ func (tr *TemplateRender) handleMain(w http.ResponseWriter, r *http.Request, mes
 		signedin = false
 	}
 	tr.SignedIn = signedin
-	tr.DomainIsPrivate = !ispublic && tr.Domain != "public"
+	tr.DomainIsPrivate = !ispublic && (tr.Domain != "public" || tr.rwt.config.Private)
+	tr.PrivateEnvironment = tr.rwt.config.Private
 	tr.DomainExists = domainErr == nil
 	tr.Files, err = tr.rwt.fs.GetTopX(tr.Domain, 10)
 	if err != nil {
@@ -207,7 +209,7 @@ func (tr *TemplateRender) handleMain(w http.ResponseWriter, r *http.Request, mes
 	}
 
 	tr.MostActiveList, _ = tr.rwt.fs.GetTopXMostViews(tr.Domain, 10)
-	tr.Title = "rwtxt"
+	tr.Title = tr.Domain
 	tr.Message = message
 	tr.DomainValue = template.HTMLAttr(`value="` + tr.Domain + `"`)
 
@@ -473,7 +475,17 @@ func (tr *TemplateRender) handleViewEdit(w http.ResponseWriter, r *http.Request)
 		}
 	}()
 
-	tr.Title = f.Slug
+	// make title
+	domain := tr.Domain
+	slug := f.Slug
+	if domain == "" {
+		domain = "public"
+	}
+	if slug == "" {
+		slug = f.ID
+	}
+	tr.Title = slug + " | " + domain
+
 	tr.Rendered = utils.RenderMarkdownToHTML(initialMarkdown)
 	tr.IntroText = template.JS(introText)
 	tr.Rows = len(strings.Split(string(utils.RenderMarkdownToHTML(initialMarkdown)), "\n")) + 1
