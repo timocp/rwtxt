@@ -87,7 +87,10 @@ code {
 }
 
 .fr {
-    float: right;
+    position: fixed;
+    top: 4px;
+    right: 10px;
+    border: solid 1px #333;
 }
 
 .icons {
