@@ -47,6 +47,12 @@
 	{{end}}
 
 	{{ if and (or (not .DomainIsPrivate) (.SignedIn)) (or (ne .Domain "public") (.PrivateEnvironment)) }}
+	<p>
+			<form action="/{{.Domain}}" method="get">
+				<input type="text" name="q" value="" size="35" placeholder="Search domain...">
+				<input class="button1" type="submit" value="Search">
+			</form>
+	</p>
 	{{ if .Files }}
 	<h2>Most recent <small>(<a href="/{{.Domain}}/list">all posts</a>)</small></h2>
 	<ul>
@@ -70,12 +76,6 @@
 			{{end}}
 		</ul>
 	{{end}}
-	<p>
-			<form action="/{{.Domain}}" method="get">
-				<input type="text" name="q" value="" size="35" placeholder="Search domain...">
-				<input class="button1" type="submit" value="Search">
-			</form>
-	</p>
 	{{end}}
 	{{ if and (.SignedIn) (ne .Domain "public")}}
 	<p>
