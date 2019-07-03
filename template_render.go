@@ -4,15 +4,22 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"image/jpeg"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/disintegration/imaging"
 
 	log "github.com/cihub/seelog"
 	"github.com/schollz/rwtxt/pkg/db"
@@ -35,6 +42,7 @@ type TemplateRender struct {
 	DomainID           int
 	DomainKey          string
 	DomainIsPrivate    bool
+	DomainIsPublic     bool
 	PrivateEnvironment bool
 	DomainValue        template.HTMLAttr
 	DomainList         []string
@@ -46,6 +54,7 @@ type TemplateRender struct {
 	Files              []db.File
 	MostActiveList     []db.File
 	SimilarFiles       []db.File
+	AllFiles           []db.File
 	Search             string
 	DomainExists       bool
 	ShowCookieMessage  bool
@@ -53,6 +62,12 @@ type TemplateRender struct {
 	Languages          []string
 	LanguageJS         []template.JS
 	rwt                *RWTxt
+	RWTxtConfig        Config
+	RenderTime         time.Time
+	UTCOffset          int
+	Options            db.DomainOptions
+	CustomIntro        template.HTML
+	CustomCSS          template.CSS
 }
 
 type Payload struct {
@@ -106,15 +121,18 @@ func init() {
 
 func NewTemplateRender(rwt *RWTxt) *TemplateRender {
 	tr := &TemplateRender{
-		rwt: rwt,
+		rwt:         rwt,
+		RWTxtConfig: rwt.Config,
 	}
 	return tr
 }
 
 func (tr *TemplateRender) handleSearch(w http.ResponseWriter, r *http.Request, domain, query string) (err error) {
-	_, ispublic, _ := tr.rwt.fs.GetDomainFromName(domain)
-	if !tr.SignedIn && !ispublic {
-		return tr.handleMain(w, r, "need to log in to search")
+	_, tr.DomainIsPublic, tr.Options, _ = tr.rwt.fs.GetDomainFromName(domain)
+	if !tr.SignedIn && !tr.DomainIsPublic {
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("need to log in to search")), 302)
+		return
+
 	}
 	files, errGet := tr.rwt.fs.Find(query, tr.Domain)
 	if errGet != nil {
@@ -124,9 +142,10 @@ func (tr *TemplateRender) handleSearch(w http.ResponseWriter, r *http.Request, d
 }
 
 func (tr *TemplateRender) handleList(w http.ResponseWriter, r *http.Request, query string, files []db.File) (err error) {
-	_, ispublic, _ := tr.rwt.fs.GetDomainFromName(tr.Domain)
-	if !tr.SignedIn && !ispublic {
-		return tr.handleMain(w, r, "need to log in to list")
+	_, tr.DomainIsPublic, tr.Options, _ = tr.rwt.fs.GetDomainFromName(tr.Domain)
+	if !tr.SignedIn && !tr.DomainIsPublic {
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("need to log in to list")), 302)
+		return
 	}
 
 	// show the list page
@@ -163,23 +182,67 @@ func (tr TemplateRender) updateDomainCookie(w http.ResponseWriter, r *http.Reque
 	return http.Cookie{
 		Name:    "rwtxt-domains",
 		Value:   strings.Join(domainKeyList, ","),
-		Expires: time.Now().Add(365 * 24 * time.Hour),
+		Expires: time.Now().UTC().Add(365 * 24 * time.Hour),
 	}
 }
 
-func (tr *TemplateRender) handleMain(w http.ResponseWriter, r *http.Request, message string) (err error) {
+func (tr *TemplateRender) handleMain(w http.ResponseWriter, r *http.Request) (err error) {
 	// set the default domain if it doesn't exist
 	if tr.SignedIn && tr.DefaultDomain != tr.Domain {
 		cookie := tr.updateDomainCookie(w, r)
 		http.SetCookie(w, &cookie)
 	}
 
+	message := r.URL.Query().Get("m")
+	if message != "" {
+		messageB, errDecode := base64.URLEncoding.DecodeString(message)
+		if errDecode == nil {
+			message = string(messageB)
+			log.Debugf("got message: '%s'", message)
+		}
+	}
+
+	var domainErr error
+	tr.DomainID, tr.DomainIsPublic, tr.Options, domainErr = tr.rwt.fs.GetDomainFromName(tr.Domain)
+
+	// // check cache if signed in
+	// if tr.SignedIn && message == "" {
+	// 	latestEntry, err := tr.rwt.fs.LatestEntryFromDomainID(tr.DomainID)
+	// 	if err == nil {
+	// 		log.Debugf("latest entry from %s: %s", tr.Domain, latestEntry)
+	// 		var trBytes []byte
+	// 		trBytes, err = tr.rwt.fs.GetCacheHTML(tr.Domain, true)
+	// 		if err == nil {
+	// 			err = json.Unmarshal(trBytes, &tr)
+	// 			if err != nil {
+	// 				log.Debug(err)
+	// 			} else {
+	// 				// erase message
+	// 				tr.Message = ""
+	// 				log.Debugf("last render time: %s, %v", tr.RenderTime, tr.RenderTime.After(latestEntry))
+	// 				if tr.RenderTime.After(latestEntry) {
+	// 					log.Debug("using cache")
+	// 					w.Header().Set("Content-Encoding", "gzip")
+	// 					w.Header().Set("Content-Type", "text/html")
+	// 					gz := gzip.NewWriter(w)
+	// 					defer gz.Close()
+	// 					return tr.rwt.mainTemplate.Execute(gz, tr)
+	// 				}
+	// 			}
+	// 		} else {
+	// 			log.Debugf("could not unmarshal: %s", err.Error())
+	// 		}
+	// 	} else {
+	// 		log.Debugf("latest entry error: %s", err.Error())
+	// 	}
+	// }
+
 	// create a page to write to
 	newFile := db.File{
 		ID:       utils.UUID(),
-		Created:  time.Now(),
+		Created:  time.Now().UTC(),
 		Domain:   tr.Domain,
-		Modified: time.Now(),
+		Modified: time.Now().UTC(),
 	}
 	defer func() {
 		go func() {
@@ -193,31 +256,73 @@ func (tr *TemplateRender) handleMain(w http.ResponseWriter, r *http.Request, mes
 	tr.RandomUUID = newFile.ID
 
 	// delete this
-	_, ispublic, domainErr := tr.rwt.fs.GetDomainFromName(tr.Domain)
 	signedin := tr.SignedIn
 	if domainErr != nil {
 		// domain does NOT exist
 		signedin = false
 	}
 	tr.SignedIn = signedin
-	tr.DomainIsPrivate = !ispublic && (tr.Domain != "public" || tr.rwt.config.Private)
-	tr.PrivateEnvironment = tr.rwt.config.Private
+	tr.DomainIsPrivate = !tr.DomainIsPublic && (tr.Domain != "public" || tr.rwt.Config.Private)
+	tr.PrivateEnvironment = tr.rwt.Config.Private
 	tr.DomainExists = domainErr == nil
-	tr.Files, err = tr.rwt.fs.GetTopX(tr.Domain, 10)
+
+	// make default options
+	if tr.Options.MostRecent+tr.Options.MostEdited+tr.Options.LastCreated == 0 {
+		tr.Options.MostRecent = 10
+		tr.Options.MostEdited = 10
+	}
+	tr.Files, err = tr.rwt.fs.GetTopX(tr.Domain, tr.Options.MostRecent, tr.RWTxtConfig.OrderByCreated)
 	if err != nil {
 		log.Debug(err)
 	}
+	tr.AllFiles, err = tr.rwt.fs.GetAll(tr.Domain, true)
+	if err != nil {
+		log.Debug(err)
+	}
+	if len(tr.AllFiles) > tr.Options.LastCreated {
+		tr.AllFiles = tr.AllFiles[:tr.Options.LastCreated]
+	}
 
-	tr.MostActiveList, _ = tr.rwt.fs.GetTopXMostViews(tr.Domain, 10)
+	tr.MostActiveList, _ = tr.rwt.fs.GetTopXMostViews(tr.Domain, tr.Options.MostEdited)
 	tr.Title = tr.Domain
 	tr.Message = message
 	tr.DomainValue = template.HTMLAttr(`value="` + tr.Domain + `"`)
+	tr.RenderTime = time.Now().UTC()
+	if tr.Options.CustomIntro != "" {
+		tr.CustomIntro = template.HTML(utils.RenderMarkdownToHTML(tr.Options.CustomIntro))
+	}
+	if tr.Options.CSS != "" {
+		tr.CustomCSS = template.CSS(tr.Options.CSS)
+	}
+
+	// go func() {
+	// 	if signedin {
+	// 		return
+	// 	}
+	// 	trBytes, err := json.Marshal(tr)
+	// 	if err != nil {
+	// 		log.Error(err)
+	// 	}
+	// 	err = tr.rwt.fs.SetCacheHTML(tr.Domain, trBytes)
+	// 	if err != nil {
+	// 		log.Error(err)
+	// 	}
+	// }()
 
 	w.Header().Set("Content-Encoding", "gzip")
 	w.Header().Set("Content-Type", "text/html")
 	gz := gzip.NewWriter(w)
 	defer gz.Close()
 	return tr.rwt.mainTemplate.Execute(gz, tr)
+}
+
+func (tr *TemplateRender) getUTCOffsetFromCookie(r *http.Request) {
+	c, err := r.Cookie("UTCOffset")
+	if err == nil {
+		tr.UTCOffset, _ = strconv.Atoi(c.Value)
+	}
+	log.Debugf("got utc offset: %d", tr.UTCOffset)
+	return
 }
 
 func (tr *TemplateRender) handleLogout(w http.ResponseWriter, r *http.Request) (err error) {
@@ -236,7 +341,8 @@ func (tr *TemplateRender) handleLogout(w http.ResponseWriter, r *http.Request) (
 		http.SetCookie(w, c)
 	}
 
-	return tr.handleMain(w, r, "You are not logged in.")
+	http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("you are not logged in")), 302)
+	return
 }
 
 func (tr *TemplateRender) handleLogin(w http.ResponseWriter, r *http.Request) (err error) {
@@ -244,16 +350,17 @@ func (tr *TemplateRender) handleLogin(w http.ResponseWriter, r *http.Request) (e
 	password := strings.TrimSpace(r.FormValue("password"))
 	if tr.Domain == "public" || tr.Domain == "" {
 		tr.Domain = "public"
-		return tr.handleMain(w, r, "")
+		return tr.handleMain(w, r)
 	}
 	if password == "" {
 		tr.Domain = "public"
-		return tr.handleMain(w, r, "domain key cannot be empty")
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("domain key cannot be empty")), 302)
+		return
 	}
 	var key string
 
 	// check if exists
-	_, _, err = tr.rwt.fs.GetDomainFromName(tr.Domain)
+	_, _, _, err = tr.rwt.fs.GetDomainFromName(tr.Domain)
 	if err != nil {
 		// domain doesn't exist, create it
 		log.Debugf("domain '%s' doesn't exist, creating it", tr.Domain)
@@ -261,13 +368,15 @@ func (tr *TemplateRender) handleLogin(w http.ResponseWriter, r *http.Request) (e
 		if err != nil {
 			log.Error(err)
 			tr.Domain = "public"
-			return tr.handleMain(w, r, err.Error())
+			http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+			return
 		}
 	}
 	tr.DomainKey, err = tr.rwt.fs.SetKey(tr.Domain, password)
 	if err != nil {
 		tr.Domain = "public"
-		return tr.handleMain(w, r, err.Error())
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+		return
 	}
 
 	log.Debugf("new key: %s", key)
@@ -279,25 +388,46 @@ func (tr *TemplateRender) handleLogin(w http.ResponseWriter, r *http.Request) (e
 }
 
 func (tr *TemplateRender) handleLoginUpdate(w http.ResponseWriter, r *http.Request) (err error) {
+	tr.SignedIn, tr.DomainKey, tr.DefaultDomain, tr.DomainList, tr.DomainKeys = tr.rwt.isSignedIn(w, r, r.FormValue("domain"))
+	if !tr.SignedIn {
+		domain := r.FormValue("domain")
+		if domain == "" {
+			domain = "public"
+		}
+		http.Redirect(w, r, "/"+domain+"?m="+base64.URLEncoding.EncodeToString([]byte("must be signed in")), 302)
+		return
+	}
 	tr.DomainKey = strings.TrimSpace(strings.ToLower(r.FormValue("domain_key")))
 	tr.Domain = strings.TrimSpace(strings.ToLower(r.FormValue("domain")))
 	password := strings.TrimSpace(r.FormValue("password"))
 	isPublic := strings.TrimSpace(r.FormValue("ispublic")) == "on"
+	options := db.DomainOptions{}
+	options.ShowSearch = strings.TrimSpace(r.FormValue("showsearch")) == "on"
+	options.LastCreated, _ = strconv.Atoi(r.FormValue("created"))
+	options.MostRecent, _ = strconv.Atoi(r.FormValue("recent"))
+	options.MostEdited, _ = strconv.Atoi(r.FormValue("edited"))
+	options.CSS = strings.TrimSpace(r.FormValue("css"))
+	options.CustomTitle = strings.TrimSpace(r.FormValue("title"))
+	options.CustomIntro = strings.TrimSpace(r.FormValue("intro"))
+
+	log.Debugf("new options: %+v", options)
 	if tr.Domain == "public" || tr.Domain == "" {
 		tr.Domain = "public"
-		return tr.handleMain(w, r, "cannot modify public")
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("cannot modify public")), 302)
+		return
 	}
 
 	// check that the key is valid
-	domainFound, err := tr.rwt.fs.CheckKey(tr.DomainKey)
+	_, domainFound, err := tr.rwt.fs.CheckKey(tr.DomainKey)
 	if err != nil || tr.Domain != domainFound {
 		if err != nil {
 			log.Debug(err)
 		}
-		return tr.handleMain(w, r, err.Error())
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+		return
 	}
 
-	err = tr.rwt.fs.UpdateDomain(tr.Domain, password, isPublic)
+	err = tr.rwt.fs.UpdateDomain(tr.Domain, password, isPublic, options)
 	message := "settings updated"
 	if password != "" {
 		message = "password updated"
@@ -305,7 +435,8 @@ func (tr *TemplateRender) handleLoginUpdate(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		message = err.Error()
 	}
-	return tr.handleMain(w, r, message)
+	http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(message)), 302)
+	return
 }
 
 func (tr *TemplateRender) handleWebsocket(w http.ResponseWriter, r *http.Request) (err error) {
@@ -334,14 +465,14 @@ func (tr *TemplateRender) handleWebsocket(w http.ResponseWriter, r *http.Request
 			}
 			break
 		}
-		// log.Debugf("recv: %v", p)
+		log.Debugf("recv: %v", p)
 
 		if !domainChecked {
 			domainChecked = true
 			if p.Domain == "public" {
 				domainValidated = true
 			} else {
-				_, keyErr := tr.rwt.fs.CheckKey(p.DomainKey)
+				_, _, keyErr := tr.rwt.fs.CheckKey(p.DomainKey)
 				if keyErr == nil {
 					domainValidated = true
 				}
@@ -361,7 +492,7 @@ func (tr *TemplateRender) handleWebsocket(w http.ResponseWriter, r *http.Request
 				ID:      p.ID,
 				Slug:    p.Slug,
 				Data:    data,
-				Created: time.Now(),
+				Created: time.Now().UTC(),
 				Domain:  p.Domain,
 			}
 			err = tr.rwt.fs.Save(editFile)
@@ -398,54 +529,125 @@ func (tr *TemplateRender) handleViewEdit(w http.ResponseWriter, r *http.Request)
 	// handle new page
 	// get edit url parameter
 	log.Debugf("loading %s", tr.Page)
-	havePage, err := tr.rwt.fs.Exists(tr.Page, tr.Domain)
+	timeStart := time.Now().UTC()
+	defer func() {
+		log.Debugf("loaded %s in %s", tr.Page, time.Since(timeStart))
+	}()
+
+	timerStart := time.Now().UTC()
+	pageID, many, err := tr.rwt.fs.Exists(tr.Page, tr.Domain)
 	if err != nil {
 		return
 	}
+	log.Debugf("many: %+v", many)
+	log.Debugf("checked havepage %s", time.Since(timerStart))
+
 	initialMarkdown := ""
 	var f db.File
 
 	// check if domain is public and exists
-	_, ispublic, errGet := tr.rwt.fs.GetDomainFromName(tr.Domain)
-	if errGet == nil && !tr.SignedIn && !ispublic {
-		return tr.handleMain(w, r, "domain is not public, sign in first")
+	timerStart = time.Now().UTC()
+	var errGet error
+	_, tr.DomainIsPublic, tr.Options, errGet = tr.rwt.fs.GetDomainFromName(tr.Domain)
+	if errGet == nil && !tr.SignedIn && !tr.DomainIsPublic {
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("domain is not public, sign in first")), 302)
+		return
 	}
+	log.Debugf("checked domain %s", time.Since(timerStart))
 
-	if havePage {
+	// check whether want to serve raw
+	showRaw := r.URL.Query().Get("raw") != ""
+	log.Debugf("raw page: '%v'", showRaw)
+
+	// load from cache
+	// if !many {
+	// 	var trBytes []byte
+	// 	trBytes, err = tr.rwt.fs.GetCacheHTML(pageID)
+	// 	if err == nil {
+	// 		err = json.Unmarshal(trBytes, &tr)
+	// 		if err != nil {
+	// 			log.Error(err)
+	// 		} else {
+	// 			log.Debug("using cache")
+	// 			if showRaw {
+	// 				w.Header().Set("Content-Encoding", "gzip")
+	// 				w.Header().Set("Content-Type", "text/plain")
+	// 				gz := gzip.NewWriter(w)
+	// 				defer gz.Close()
+	// 				_, err = gz.Write([]byte(tr.File.Data))
+	// 				return
+	// 			}
+	// 			w.Header().Set("Content-Encoding", "gzip")
+	// 			w.Header().Set("Content-Type", "text/html")
+	// 			gz := gzip.NewWriter(w)
+	// 			defer gz.Close()
+	// 			return tr.rwt.viewEditTemplate.Execute(gz, tr)
+	// 		}
+	// 	}
+	// }
+
+	if pageID != "" {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			timerStart = time.Now().UTC()
+			tr.SimilarFiles, err = tr.rwt.fs.GetSimilar(pageID)
+			if err != nil {
+				log.Error(err)
+			}
+			log.Debugf("got %s similar in %s", tr.Page, time.Since(timerStart))
+		}()
+
 		var files []db.File
-		files, err = tr.rwt.fs.Get(tr.Page, tr.Domain)
+		timerStart = time.Now().UTC()
+		if !many {
+			files, err = tr.rwt.fs.Get(pageID, tr.Domain)
+		} else {
+			files, err = tr.rwt.fs.Get(tr.Page, tr.Domain)
+		}
 		if err != nil {
 			log.Error(err)
-			return tr.handleMain(w, r, err.Error())
+			http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+			return
 		}
 		if len(files) > 1 {
 			return tr.handleList(w, r, tr.Page, files)
 		} else {
 			f = files[0]
 		}
-		tr.SimilarFiles, err = tr.rwt.fs.GetSimilar(f.ID)
-		if err != nil {
-			log.Error(err)
-		}
+		log.Debugf("got %s content in %s", tr.Page, time.Since(timerStart))
+		wg.Wait()
 	} else {
 		uuid := utils.UUID()
 		f = db.File{
 			ID:       uuid,
-			Created:  time.Now(),
+			Created:  time.Now().UTC(),
 			Domain:   tr.Domain,
-			Modified: time.Now(),
+			Modified: time.Now().UTC(),
 		}
 		f.Slug = tr.Page
 		f.Data = ""
 		err = tr.rwt.fs.Save(f)
 		if err != nil {
-			return tr.handleMain(w, r, "domain does not exist")
+			err = fmt.Errorf("domain does not exist")
+			http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+			return
 		}
 		log.Debugf("saved: %+v", f)
 		http.Redirect(w, r, "/"+tr.Domain+"/"+tr.Page, 302)
 		return
 	}
 	tr.File = f
+
+	if showRaw {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "text/plain")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		_, err = gz.Write([]byte(tr.File.Data))
+		return
+	}
 
 	// get a specific version
 	version := r.URL.Query().Get("version")
@@ -476,6 +678,7 @@ func (tr *TemplateRender) handleViewEdit(w http.ResponseWriter, r *http.Request)
 	}()
 
 	// make title
+	timerStart = time.Now().UTC()
 	domain := tr.Domain
 	slug := f.Slug
 	if domain == "" {
@@ -485,18 +688,35 @@ func (tr *TemplateRender) handleViewEdit(w http.ResponseWriter, r *http.Request)
 		slug = f.ID
 	}
 	tr.Title = slug + " | " + domain
-
 	tr.Rendered = utils.RenderMarkdownToHTML(initialMarkdown)
+	if tr.Options.CSS != "" {
+		tr.CustomCSS = template.CSS(tr.Options.CSS)
+	}
+
 	tr.IntroText = template.JS(introText)
 	tr.Rows = len(strings.Split(string(utils.RenderMarkdownToHTML(initialMarkdown)), "\n")) + 1
 	tr.EditOnly = strings.TrimSpace(f.Data) == ""
 	tr.Languages = utils.DetectMarkdownCodeBlockLanguages(initialMarkdown)
+	log.Debugf("processed %s content in %s", tr.Page, time.Since(timerStart))
+
+	// go func() {
+	// 	if tr.SignedIn {
+	// 		return
+	// 	}
+	// 	trBytes, err := json.Marshal(tr)
+	// 	if err != nil {
+	// 		log.Error(err)
+	// 	}
+	// 	err = tr.rwt.fs.SetCacheHTML(f.ID, trBytes)
+	// 	if err != nil {
+	// 		log.Error(err)
+	// 	}
+	// }()
 
 	w.Header().Set("Content-Encoding", "gzip")
 	w.Header().Set("Content-Type", "text/html")
 	gz := gzip.NewWriter(w)
 	defer gz.Close()
-	log.Debug(strings.TrimSpace(f.Data))
 
 	return tr.rwt.viewEditTemplate.Execute(gz, tr)
 
@@ -508,6 +728,72 @@ func (tr *TemplateRender) handleUploads(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	log.Debug("ResizeOnRequest", tr.rwt.Config.ResizeOnRequest)
+	log.Debug("ResizeWidth", tr.rwt.Config.ResizeWidth)
+	log.Debug("name", name)
+	if tr.rwt.Config.ResizeWidth > 0 && tr.rwt.Config.ResizeOnRequest && (strings.Contains(strings.ToLower(name), ".jpg") || strings.Contains(strings.ToLower(name), ".jpeg")) {
+		// Get resized image
+		name, data, _, err = tr.rwt.fs.GetResizedImage(id)
+		if err != nil && err != sql.ErrNoRows {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Create if not exists
+		if err != nil && err == sql.ErrNoRows {
+			log.Debug("resizing image ", id)
+
+			var bigImgBytes []byte
+			name, bigImgBytes, _, err = tr.rwt.fs.GetBlob(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			r, err := gzip.NewReader(bytes.NewReader(bigImgBytes))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return err
+			}
+
+			var buf bytes.Buffer
+			_, err = buf.ReadFrom(r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return err
+			}
+
+			img, err := jpeg.Decode(&buf)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return err
+			}
+
+			img = imaging.Resize(img, tr.rwt.Config.ResizeWidth, 0, imaging.Lanczos)
+
+			var bufout bytes.Buffer
+			gw := gzip.NewWriter(&bufout)
+			err = jpeg.Encode(gw, img, nil)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return err
+			}
+			err = gw.Flush()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return err
+			}
+
+			err = tr.rwt.fs.SaveResizedImage(id, name, bufout.Bytes())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return err
+			}
+
+			data = bufout.Bytes()
+		}
+
 	}
 
 	w.Header().Set("Vary", "Accept-Encoding")
@@ -544,45 +830,97 @@ func (tr *TemplateRender) handleUpload(w http.ResponseWriter, r *http.Request) (
 	}
 	defer file.Close()
 
-	h := sha256.New()
-	if _, err = io.Copy(h, file); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	id := fmt.Sprintf("sha256-%x", h.Sum(nil))
+	if tr.rwt.Config.ResizeWidth > 0 && tr.rwt.Config.ResizeOnUpload && (strings.Contains(strings.ToLower(info.Filename), ".jpg") || strings.Contains(strings.ToLower(info.Filename), ".jpeg")) {
+		log.Debug("process jpg upload")
+		img, err := jpeg.Decode(file)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return err
+		}
 
-	// copy file to buffer
-	file.Seek(0, io.SeekStart)
-	var fileData bytes.Buffer
-	gzipWriter := gzip.NewWriter(&fileData)
-	_, err = io.Copy(gzipWriter, file)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	gzipWriter.Close()
+		img = imaging.Resize(img, tr.rwt.Config.ResizeWidth, 0, imaging.Lanczos)
 
-	// save file
-	err = tr.rwt.fs.SaveBlob(id, info.Filename, fileData.Bytes())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+		var bufout bytes.Buffer
+		err = jpeg.Encode(&bufout, img, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return err
+		}
 
-	w.Header().Set("Location", "/uploads/"+id+"?filename="+url.QueryEscape(info.Filename))
-	_, err = w.Write([]byte("ok"))
-	return
+		h := sha256.New()
+		h.Write(bufout.Bytes())
+		id := fmt.Sprintf("sha256-%x", h.Sum(nil))
+
+		var fileData bytes.Buffer
+		gw := gzip.NewWriter(&fileData)
+		_, err = io.Copy(gw, bytes.NewBuffer(bufout.Bytes()))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+		err = gw.Close()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+
+		err = tr.rwt.fs.SaveBlob(id, info.Filename, fileData.Bytes())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+
+		w.Header().Set("Location", "/uploads/"+id+"?filename="+url.QueryEscape(info.Filename))
+		_, err = w.Write([]byte("ok"))
+		return err
+	} else {
+		log.Debug("process standard upload")
+		b, err := ioutil.ReadAll(file)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+		h := sha256.New()
+		h.Write(b)
+		id := fmt.Sprintf("sha256-%x", h.Sum(nil))
+
+		var fileData bytes.Buffer
+		gw := gzip.NewWriter(&fileData)
+		_, err = io.Copy(gw, bytes.NewReader(b))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+		err = gw.Close()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+
+		// save file
+		err = tr.rwt.fs.SaveBlob(id, info.Filename, fileData.Bytes())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+
+		w.Header().Set("Location", "/uploads/"+id+"?filename="+url.QueryEscape(info.Filename))
+		_, err = w.Write([]byte("ok"))
+		return err
+	}
 }
 
 func (tr *TemplateRender) handleExport(w http.ResponseWriter, r *http.Request) (err error) {
 	log.Debug("exporting")
 	if tr.Domain == "public" {
-		return tr.handleMain(w, r, "can't export public")
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("cannot export public")), 302)
+		return
 	}
 	if !tr.SignedIn {
-		return tr.handleMain(w, r, "must sign in")
+		http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte("must sign in")), 302)
+		return
 	}
-	files, _ := tr.rwt.fs.GetAll(tr.Domain)
+	files, _ := tr.rwt.fs.GetAll(tr.Domain, tr.RWTxtConfig.OrderByCreated)
 	for i := range files {
 		files[i].DataHTML = template.HTML("")
 	}
@@ -590,4 +928,8 @@ func (tr *TemplateRender) handleExport(w http.ResponseWriter, r *http.Request) (
 	js, err := json.Marshal(files)
 	w.Write(js)
 	return
+}
+
+func replace(input, from, to string) string {
+	return strings.Replace(input, from, to, -1)
 }

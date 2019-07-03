@@ -202,8 +202,10 @@ if (getParameterByName("edit") != null) {
 
 function showMessage() {
     var x = document.getElementById("snackbar");
-    x.className = "show";
-    setTimeout(function(){ x.className = x.className.replace("show", ""); }, 3000);
+    if (x != null) {
+        x.className = "show";
+        setTimeout(function(){ x.className = x.className.replace("show", ""); }, 3000);
+    }
 }
 
 
@@ -229,15 +231,18 @@ function onUploadFinished(file) {
         file.xhr.getResponseHeader("Location") +
         ')';
 
+    var newLine = "\n"
     document.getElementById("editable").value = (
         textBefore +
-        extraText +
+        extraText + 
+        newLine +
         textAfter
     );
 
+    console.log("SELECT LINK")
     // Select the newly-inserted link
-    document.getElementById("editable").selectionStart = cursorPos;
-    document.getElementById("editable").selectionEnd = cursorPos + extraText.length;
+    document.getElementById("editable").selectionStart = cursorPos + extraText.length + newLine.length;
+    document.getElementById("editable").selectionEnd = cursorPos + extraText.length + newLine.length;
    // expand textarea
     autoExpand(document.getElementById("editable"));
    // trigger a save

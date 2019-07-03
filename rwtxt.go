@@ -2,6 +2,8 @@ package rwtxt
 
 import (
 	"compress/gzip"
+	"encoding/base64"
+	"fmt"
 	"html/template"
 	"net/http"
 	"sort"
@@ -18,8 +20,7 @@ import (
 const DefaultBind = ":8152"
 
 type RWTxt struct {
-	Bind             string // interface:port to listen on, defaults to DefaultBind.
-	config           Config
+	Config           Config
 	viewEditTemplate *template.Template
 	mainTemplate     *template.Template
 	loginTemplate    *template.Template
@@ -30,14 +31,24 @@ type RWTxt struct {
 }
 
 type Config struct {
-	Private bool
+	Bind            string // interface:port to listen on, defaults to DefaultBind.
+	Private         bool
+	ResizeWidth     int
+	ResizeOnUpload  bool
+	ResizeOnRequest bool
+	OrderByCreated  bool
 }
 
-func New(fs *db.FileSystem, config Config) (*RWTxt, error) {
+func New(fs *db.FileSystem, configUser ...Config) (*RWTxt, error) {
+	config := Config{
+		Bind: ":8152",
+	}
+	if len(configUser) > 0 {
+		config = configUser[0]
+	}
 	rwt := &RWTxt{
-		Bind:   DefaultBind,
+		Config: config,
 		fs:     fs,
-		config: config,
 		wsupgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -45,6 +56,10 @@ func New(fs *db.FileSystem, config Config) (*RWTxt, error) {
 				return true
 			},
 		},
+	}
+
+	funcMap := template.FuncMap{
+		"replace": replace,
 	}
 
 	var err error
@@ -63,7 +78,7 @@ func New(fs *db.FileSystem, config Config) (*RWTxt, error) {
 		return nil, err
 	}
 
-	rwt.mainTemplate = template.Must(template.New("main").Parse(string(b)))
+	rwt.mainTemplate = template.Must(template.New("main").Funcs(funcMap).Parse(string(b)))
 
 	err = templateAssets(headerFooter, rwt.mainTemplate)
 
@@ -98,7 +113,7 @@ func templateAssets(s []string, t *template.Template) error {
 
 func (rwt *RWTxt) Serve() (err error) {
 	go func() {
-		lastDumped := time.Now()
+		lastDumped := time.Now().UTC()
 		for {
 			time.Sleep(120 * time.Second)
 			lastModified, errGet := rwt.fs.LastModified()
@@ -115,13 +130,13 @@ func (rwt *RWTxt) Serve() (err error) {
 				if errDump != nil {
 					log.Error(errDump)
 				}
-				lastDumped = time.Now()
+				lastDumped = time.Now().UTC()
 			}
 		}
 	}()
-	log.Infof("listening on %v", rwt.Bind)
+	log.Infof("listening on %v", rwt.Config.Bind)
 	http.HandleFunc("/", rwt.Handler)
-	return http.ListenAndServe(rwt.Bind, nil)
+	return http.ListenAndServe(rwt.Config.Bind, nil)
 }
 
 func (rwt *RWTxt) isSignedIn(w http.ResponseWriter, r *http.Request, domain string) (signedin bool, domainkey string, defaultDomain string, domainList []string, domainKeys map[string]string) {
@@ -141,15 +156,15 @@ func (rwt *RWTxt) isSignedIn(w http.ResponseWriter, r *http.Request, domain stri
 }
 
 func (rwt *RWTxt) getDomainListCookie(w http.ResponseWriter, r *http.Request) (domainKeys map[string]string, defaultDomain string) {
-	startTime := time.Now()
+	startTime := time.Now().UTC()
 	domainKeys = make(map[string]string)
 	cookie, cookieErr := r.Cookie("rwtxt-domains")
 	keysToUpdate := []string{}
 	if cookieErr == nil {
 		log.Debugf("got cookie: %s", cookie.Value)
 		for _, key := range strings.Split(cookie.Value, ",") {
-			startTime2 := time.Now()
-			domainName, domainErr := rwt.fs.CheckKey(key)
+			startTime2 := time.Now().UTC()
+			_, domainName, domainErr := rwt.fs.CheckKey(key)
 			log.Debugf("checked key: %s [%s]", key, time.Since(startTime2))
 			if domainErr == nil && domainName != "" {
 				if defaultDomain == "" {
@@ -174,7 +189,7 @@ func (rwt *RWTxt) getDomainListCookie(w http.ResponseWriter, r *http.Request) (d
 }
 
 func (rwt *RWTxt) Handler(w http.ResponseWriter, r *http.Request) {
-	t := time.Now()
+	t := time.Now().UTC()
 	err := rwt.Handle(w, r)
 	if err != nil {
 		log.Error(err)
@@ -183,6 +198,7 @@ func (rwt *RWTxt) Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rwt *RWTxt) Handle(w http.ResponseWriter, r *http.Request) (err error) {
+
 	// very special paths
 	if r.URL.Path == "/robots.txt" {
 		// special path
@@ -212,6 +228,9 @@ Disallow: /`))
 
 	tr.SignedIn, tr.DomainKey, tr.DefaultDomain, tr.DomainList, tr.DomainKeys = rwt.isSignedIn(w, r, tr.Domain)
 
+	// get browser local time
+	tr.getUTCOffsetFromCookie(r)
+
 	if r.URL.Path == "/" {
 		// special path /
 		http.Redirect(w, r, "/"+tr.DefaultDomain, 302)
@@ -239,21 +258,25 @@ Disallow: /`))
 		return tr.handleUploads(w, r, tr.Page)
 	} else if tr.Domain != "" && tr.Page == "" {
 		if r.URL.Query().Get("q") != "" {
-			if tr.Domain == "public" && !rwt.config.Private {
-				return tr.handleMain(w, r, "can't search public")
+			if tr.Domain == "public" && !rwt.Config.Private {
+				err = fmt.Errorf("cannot search public")
+				http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+				return
 			}
 			return tr.handleSearch(w, r, tr.Domain, r.URL.Query().Get("q"))
 		}
 		// domain exists, handle normally
-		return tr.handleMain(w, r, "")
+		return tr.handleMain(w, r)
 	} else if tr.Domain != "" && tr.Page != "" {
 		log.Debugf("[%s/%s]", tr.Domain, tr.Page)
 		if tr.Page == "list" {
-			if tr.Domain == "public" && !rwt.config.Private {
-				return tr.handleMain(w, r, "can't list public")
+			if tr.Domain == "public" && !rwt.Config.Private {
+				err = fmt.Errorf("cannot list public")
+				http.Redirect(w, r, "/"+tr.Domain+"?m="+base64.URLEncoding.EncodeToString([]byte(err.Error())), 302)
+				return
 			}
 
-			files, _ := rwt.fs.GetAll(tr.Domain)
+			files, _ := rwt.fs.GetAll(tr.Domain, tr.RWTxtConfig.OrderByCreated)
 			for i := range files {
 				files[i].Data = ""
 				files[i].DataHTML = template.HTML("")
@@ -289,8 +312,19 @@ func (rwt *RWTxt) handlePrism(w http.ResponseWriter, r *http.Request) (err error
 
 func (rwt *RWTxt) handleStatic(w http.ResponseWriter, r *http.Request) (err error) {
 	page := r.URL.Path
+	e := `"` + r.URL.Path + `"`
+
+	//https://www.sanarias.com/blog/115LearningHTTPcachinginGo
 	w.Header().Set("Vary", "Accept-Encoding")
-	w.Header().Set("Cache-Control", "public, max-age=7776000")
+	w.Header().Set("Etag", e)
+	w.Header().Set("Cache-Control", "max-age=2592000") // 30 days
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if strings.Contains(match, e) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Encoding", "gzip")
 	if strings.HasPrefix(page, "/static") {
 		page = "assets/" + strings.TrimPrefix(page, "/static/")
@@ -314,9 +348,9 @@ func (rwt *RWTxt) handleStatic(w http.ResponseWriter, r *http.Request) (err erro
 func (rwt *RWTxt) createPage(domain string) (f db.File) {
 	f = db.File{
 		ID:       utils.UUID(),
-		Created:  time.Now(),
+		Created:  time.Now().UTC(),
 		Domain:   domain,
-		Modified: time.Now(),
+		Modified: time.Now().UTC(),
 	}
 	err := rwt.fs.Save(f)
 	if err != nil {

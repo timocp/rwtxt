@@ -2,11 +2,16 @@ package db
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"html/template"
+	"io/ioutil"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +40,32 @@ type File struct {
 	History  versionedtext.VersionedText `json:"history"`
 	DataHTML template.HTML               `json:"data_html,omitempty"`
 	Views    int                         `json:"views"`
+}
+
+type DomainOptions struct {
+	MostEdited  int
+	MostRecent  int
+	LastCreated int
+	CSS         string
+	CustomIntro string
+	CustomTitle string
+	ShowSearch  bool
+}
+
+func formattedDate(t time.Time, utcOffset int) string {
+	loc, err := time.LoadLocation(fmt.Sprintf("Etc/GMT%+d", utcOffset))
+	if err != nil {
+		return t.Format("3:04pm Jan 2 2006")
+	}
+	return t.In(loc).Format("3:04pm Jan 2 2006")
+}
+
+func (f File) CreatedDate(utcOffset int) string {
+	return formattedDate(f.Created, utcOffset)
+}
+
+func (f File) ModifiedDate(utcOffset int) string {
+	return formattedDate(f.Modified, utcOffset)
 }
 
 // New will initialize a filesystem by creating DB and calling InitializeDB.
@@ -112,7 +143,8 @@ func (fs *FileSystem) InitializeDB(dump bool) (err error) {
 		id INTEGER NOT NULL PRIMARY KEY,
 		name TEXT,
 		hashed_pass TEXT,
-		ispublic INTEGER DEFAULT 0
+		ispublic INTEGER DEFAULT 0,
+		options BLOB
 	);`
 	_, err = fs.DB.Exec(sqlStmt)
 	if err != nil {
@@ -154,10 +186,66 @@ func (fs *FileSystem) InitializeDB(dump bool) (err error) {
 		err = errors.Wrap(err, "creating similarities table")
 	}
 
-	domainid, _, _, _ := fs.getDomainFromName("public")
+	sqlStmt = `DROP TABLE IF EXISTS	cached_images;`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "dropping cached_images table")
+	}
+
+	sqlStmt = `CREATE TABLE IF NOT EXISTS
+	cached_images (
+		id TEXT NOT NULL PRIMARY KEY,
+		name TEXT,
+		data BLOB,
+		views INTEGER DEFAULT 0
+	);`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "creating cached_images table")
+	}
+
+	sqlStmt = `DROP TABLE IF EXISTS	cached_html;`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "dropping cached_html table")
+	}
+
+	sqlStmt = `CREATE TABLE IF NOT EXISTS
+	cached_html (
+		id TEXT NOT NULL PRIMARY KEY,
+		modified TIMESTAMP,
+		tr BLBOB
+	);`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "creating cached_html table")
+	}
+
+	sqlStmt = `CREATE INDEX IF NOT EXISTS
+	fsslugs ON fs(slug,domainid);`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "creating index")
+	}
+
+	sqlStmt = `CREATE INDEX IF NOT EXISTS
+	domainsname ON domains(name);`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "creating index")
+	}
+
+	sqlStmt = `CREATE INDEX IF NOT EXISTS
+	similarid ON similar(fsid);`
+	_, err = fs.DB.Exec(sqlStmt)
+	if err != nil {
+		err = errors.Wrap(err, "creating index")
+	}
+
+	domainid, _, _, _, _ := fs.getDomainFromName("public")
 	if domainid == 0 {
 		fs.setDomain("public", "")
-		fs.UpdateDomain("public", "", true)
+		fs.UpdateDomain("public", "", true, DomainOptions{})
 	}
 
 	if dump {
@@ -245,6 +333,226 @@ func (fs *FileSystem) SaveBlob(id string, name string, blob []byte) (err error) 
 	return
 }
 
+// ExportPosts will save posts to {{TIMESTAMP}}-posts.gz
+func (fs *FileSystem) ExportPosts() error {
+	domains, err := fs.GetDomains()
+	if err != nil {
+		return err
+	}
+
+	dir := os.TempDir()
+	postPaths := []string{}
+	for _, domain := range domains {
+		files, err := fs.GetAll(domain)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			fname := (fmt.Sprintf("%s-%s.md", file.Slug, file.ID))
+			r := strings.NewReader(file.Data)
+			if err != nil {
+				return err
+			}
+			var buf bytes.Buffer
+			_, err = buf.ReadFrom(r)
+			if err != nil {
+				return err
+			}
+			err = os.MkdirAll(filepath.Join(dir, domain), os.ModePerm)
+			if err != nil {
+				return err
+			}
+			fpath := filepath.Join(dir, domain, fname)
+			err = ioutil.WriteFile(fpath, buf.Bytes(), os.ModePerm)
+			if err != nil {
+				return err
+			}
+
+			postPaths = append(postPaths, fpath)
+		}
+	}
+	timestamp := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	for _, f := range postPaths {
+		log.Debug(f)
+	}
+	utils.ZipFiles(fmt.Sprintf("%s-posts.zip", timestamp), postPaths)
+	return nil
+
+}
+
+// ExportUploads will save uploads to {{TIMESTAMP}}-uploads.gz
+func (fs *FileSystem) ExportUploads() error {
+	dir := os.TempDir()
+	files := []string{}
+
+	ids, err := fs.GetBlobIDs()
+	if err != nil {
+		return err
+	}
+
+	for _, id := range ids {
+		name, data, _, err := fs.GetBlob(id)
+		if err != nil {
+			return err
+		}
+		fname := fmt.Sprintf("%s-%s", id, name)
+
+		r, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		var buf bytes.Buffer
+		_, err = buf.ReadFrom(r)
+		if err != nil {
+			return err
+		}
+		fpath := filepath.Join(dir, fname)
+		err = ioutil.WriteFile(fpath, buf.Bytes(), os.ModePerm)
+		if err != nil {
+			return err
+		}
+
+		files = append(files, fpath)
+	}
+
+	timestamp := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	for _, f := range files {
+		log.Debug(f)
+	}
+	utils.ZipFiles(fmt.Sprintf("%s-uploads.zip", timestamp), files)
+	return nil
+}
+
+// GetBlobIDs will return a list of blob ids
+func (fs *FileSystem) GetBlobIDs() ([]string, error) {
+	fs.Lock()
+	defer fs.Unlock()
+	stmt, err := fs.DB.Prepare(`SELECT id FROM blobs`)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	result := []string{}
+	rows, err := stmt.Query()
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		err = rows.Scan(&id)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, id)
+	}
+
+	return result, nil
+}
+
+// GetDomains will return a list of domains
+func (fs *FileSystem) GetDomains() ([]string, error) {
+	fs.Lock()
+	defer fs.Unlock()
+	stmt, err := fs.DB.Prepare(`SELECT name FROM domains`)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	result := []string{}
+	rows, err := stmt.Query()
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var domain string
+		err = rows.Scan(&domain)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, domain)
+	}
+
+	return result, nil
+}
+
+// SaveResizedImage will save a resized image
+func (fs *FileSystem) SaveResizedImage(id string, name string, blob []byte) (err error) {
+	fs.Lock()
+	defer fs.Unlock()
+
+	tx, err := fs.DB.Begin()
+	if err != nil {
+		return errors.Wrap(err, "begin SaveResizedImage")
+	}
+	stmt, err := tx.Prepare(`
+	INSERT OR REPLACE INTO
+		cached_images
+	(
+		id,
+		name,
+		data
+	) 
+		VALUES 	
+	(
+		?,
+		?,
+		?
+	)`)
+	if err != nil {
+		return errors.Wrap(err, "stmt SaveResizedImage")
+	}
+	_, err = stmt.Exec(
+		id, name, blob,
+	)
+	if err != nil {
+		return errors.Wrap(err, "exec SaveResizedImage")
+	}
+	defer stmt.Close()
+	err = tx.Commit()
+	if err != nil {
+		return errors.Wrap(err, "commit SaveResizedImage")
+	}
+	return
+}
+
+// GetResizedImage will resize an image (if it hasn't already been cached) return it
+func (fs *FileSystem) GetResizedImage(id string) (name string, data []byte, views int, err error) {
+	fs.Lock()
+	defer fs.Unlock()
+
+	stmt, err := fs.DB.Prepare("SELECT name,data,views FROM cached_images WHERE id = ?")
+	if err != nil {
+		return
+	}
+	defer stmt.Close()
+	err = stmt.QueryRow(id).Scan(&name, &data, &views)
+	if err != nil {
+		return
+	}
+
+	log.Debugf("id :%s, views: %d", id, views)
+
+	// update the views
+	tx, err := fs.DB.Begin()
+	if err != nil {
+		return
+	}
+	stmt, err = tx.Prepare("UPDATE blobs SET views=? WHERE id=?")
+	if err != nil {
+		return
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec(views+1, id)
+	if err != nil {
+		return
+	}
+	err = tx.Commit()
+
+	return
+}
+
 // GetBlob will save a blob
 func (fs *FileSystem) GetBlob(id string) (name string, data []byte, views int, err error) {
 	fs.Lock()
@@ -298,7 +606,7 @@ func (fs *FileSystem) Save(f File) (err error) {
 	if f.Domain == "" {
 		f.Domain = "public"
 	}
-	domainid, _, _, _ := fs.getDomainFromName(f.Domain)
+	domainid, _, _, _, _ := fs.getDomainFromName(f.Domain)
 	if domainid == 0 {
 		return errors.New("domain does not exist")
 	}
@@ -466,7 +774,7 @@ func (fs *FileSystem) SetKey(domain, password string) (key string, err error) {
 	// first check if it is a domain
 	fs.Lock()
 	defer fs.Unlock()
-	domainid, err := fs.validateDomain(domain, password)
+	domainid, _, err := fs.validateDomain(domain, password)
 	if err != nil {
 		return
 	}
@@ -555,7 +863,7 @@ func (fs *FileSystem) CheckKeys(keys []string) (domains []string, validKeys []st
 	validKeys = make([]string, len(keys))
 	i := 0
 	for _, key := range keys {
-		domain, err := fs.checkKey(key)
+		_, domain, err := fs.checkKey(key)
 		if err != nil || domain == "" {
 			continue
 		}
@@ -567,16 +875,16 @@ func (fs *FileSystem) CheckKeys(keys []string) (domains []string, validKeys []st
 }
 
 // CheckKey checks that it is a valid key for a domain
-func (fs *FileSystem) CheckKey(key string) (domain string, err error) {
+func (fs *FileSystem) CheckKey(key string) (domainid int, domain string, err error) {
 	fs.Lock()
 	defer fs.Unlock()
 	return fs.checkKey(key)
 }
 
-func (fs *FileSystem) checkKey(key string) (domain string, err error) {
+func (fs *FileSystem) checkKey(key string) (domainid int, domain string, err error) {
 	stmt, err := fs.DB.Prepare(`
 	SELECT 
-		domains.name
+	domains.id, domains.name
 	FROM keys 
 	
 	INNER JOIN domains 
@@ -588,7 +896,7 @@ func (fs *FileSystem) checkKey(key string) (domain string, err error) {
 		return
 	}
 	defer stmt.Close()
-	err = stmt.QueryRow(key).Scan(&domain)
+	err = stmt.QueryRow(key).Scan(&domainid, &domain)
 	if err != nil {
 		return
 	}
@@ -629,7 +937,7 @@ func (fs *FileSystem) SetDomain(domain, password string) (err error) {
 	// first check if it is a domain
 	fs.Lock()
 	defer fs.Unlock()
-	domainid, _, _, _ := fs.getDomainFromName(domain)
+	domainid, _, _, _, _ := fs.getDomainFromName(domain)
 	if domainid != 0 {
 		err = errors.New("domain already exists")
 		return
@@ -665,12 +973,12 @@ func (fs *FileSystem) setDomain(domain, password string) (err error) {
 	return
 }
 
-func (fs *FileSystem) UpdateDomain(domain, password string, ispublic bool) (err error) {
+func (fs *FileSystem) UpdateDomain(domain, password string, ispublic bool, options DomainOptions) (err error) {
 	fs.Lock()
 	defer fs.Unlock()
 
 	// first check if it is a domain
-	domainid, _, _, _ := fs.getDomainFromName(domain)
+	domainid, _, _, _, _ := fs.getDomainFromName(domain)
 	if domainid == 0 {
 		err = errors.New("domain does not exist")
 		return
@@ -688,15 +996,18 @@ func (fs *FileSystem) UpdateDomain(domain, password string, ispublic bool) (err 
 		return errors.Wrap(err, "begin Save")
 	}
 
+	bOptions, _ := json.Marshal(options)
+
 	if password == "" {
 		stmt, err = tx.Prepare(`UPDATE domains 
 		SET 
-		ispublic = ?
+		ispublic = ?,
+		options = ?
 		WHERE name = ?`)
 		if err != nil {
 			return errors.Wrap(err, "stmt Save")
 		}
-		_, err = stmt.Exec(isPublicValue, domain)
+		_, err = stmt.Exec(isPublicValue, bOptions, domain)
 		if err != nil {
 			return errors.Wrap(err, "exec Save")
 		}
@@ -708,12 +1019,13 @@ func (fs *FileSystem) UpdateDomain(domain, password string, ispublic bool) (err 
 		stmt, err = tx.Prepare(`UPDATE domains 
 		SET 
 		hashed_pass = ?, 
-		ispublic = ?
+		ispublic = ?,
+		options = ?
 		WHERE name = ?`)
 		if err != nil {
 			return errors.Wrap(err, "stmt Save")
 		}
-		_, err = stmt.Exec(hashedPassword, isPublicValue, domain)
+		_, err = stmt.Exec(hashedPassword, isPublicValue, bOptions, domain)
 		if err != nil {
 			return errors.Wrap(err, "exec Save")
 		}
@@ -726,17 +1038,119 @@ func (fs *FileSystem) UpdateDomain(domain, password string, ispublic bool) (err 
 	return
 }
 
+// SetCacheHTML will set the html cache
+func (fs *FileSystem) SetCacheHTML(id string, tr []byte) (err error) {
+	fs.Lock()
+	defer fs.Unlock()
+
+	tx, err := fs.DB.Begin()
+	if err != nil {
+		return errors.Wrap(err, "begin SetCache")
+	}
+
+	stmt, err := tx.Prepare(`
+	INSERT OR REPLACE INTO cached_html (id,modified,tr) VALUES (?,?,?)`)
+	if err != nil {
+		return errors.Wrap(err, "stmt Save SetCache")
+	}
+
+	_, err = stmt.Exec(id, time.Now().UTC(), tr)
+	if err != nil {
+		return errors.Wrap(err, "exec Save SetCache")
+	}
+	defer stmt.Close()
+	err = tx.Commit()
+	if err != nil {
+		return errors.Wrap(err, "commit Save SetCache")
+	}
+	return
+}
+
+// SetCacheHTML will set the html cache
+func (fs *FileSystem) GetCacheHTML(id string, noCheckLastModified ...bool) (tr []byte, err error) {
+	fs.Lock()
+	defer fs.Unlock()
+
+	doCheckLastModified := true
+	if len(noCheckLastModified) > 0 {
+		doCheckLastModified = !noCheckLastModified[0]
+	}
+
+	var fsLastModified time.Time
+	if doCheckLastModified {
+		fsLastModified, err = func(id string) (fsLastModified time.Time, err error) {
+			// prepare statement
+			stmt, err := fs.DB.Prepare("SELECT modified FROM fs WHERE id=?")
+			if err != nil {
+				err = errors.Wrap(err, "preparing query")
+				return
+			}
+
+			defer stmt.Close()
+			rows, err := stmt.Query(id)
+			if err != nil {
+				return
+			}
+
+			// loop through rows
+			defer rows.Close()
+
+			for rows.Next() {
+				err = rows.Scan(
+					&fsLastModified,
+				)
+				return
+			}
+			err = fmt.Errorf("found nothing")
+			return
+		}(id)
+		if err != nil {
+			return
+		}
+	}
+
+	// prepare statement
+	stmt, err := fs.DB.Prepare("SELECT modified,tr FROM cached_html WHERE id=?")
+	if err != nil {
+		err = errors.Wrap(err, "preparing query")
+		return
+	}
+
+	defer stmt.Close()
+	rows, err := stmt.Query(id)
+	if err != nil {
+		return
+	}
+	// loop through rows
+	defer rows.Close()
+	var cacheLastModified time.Time
+	for rows.Next() {
+		err = rows.Scan(
+			&cacheLastModified,
+			&tr,
+		)
+		if err != nil {
+			return
+		}
+	}
+	if doCheckLastModified && fsLastModified.After(cacheLastModified) {
+		err = fmt.Errorf("cache is not new")
+	}
+
+	return
+}
+
 // ValidateDomain returns the domain id or an error if the password doesn't match or if the domain doesn't exist
-func (fs *FileSystem) ValidateDomain(domain, password string) (domainid int, err error) {
+func (fs *FileSystem) ValidateDomain(domain, password string) (domainid int, options DomainOptions, err error) {
 	fs.Lock()
 	defer fs.Unlock()
 	return fs.validateDomain(domain, password)
 }
 
 // ValidateDomain returns the domain id or an error if the password doesn't match or if the domain doesn't exist
-func (fs *FileSystem) validateDomain(domain, password string) (domainid int, err error) {
+func (fs *FileSystem) validateDomain(domain, password string) (domainid int, options DomainOptions, err error) {
 	domain = strings.ToLower(domain)
-	domainid, hashedPassword, _, err := fs.getDomainFromName(domain)
+	domainid, hashedPassword, _, options, err := fs.getDomainFromName(domain)
 	if domainid == 0 {
 		err = errors.New("domain " + domain + " does not exist")
 		return
@@ -752,12 +1166,12 @@ func (fs *FileSystem) validateDomain(domain, password string) (domainid int, err
 }
 
 // GetDomainFromName returns the domain id, throwing an error if it doesn't exist
-func (fs *FileSystem) GetDomainFromName(domain string) (domainid int, ispublic bool, err error) {
+func (fs *FileSystem) GetDomainFromName(domain string) (domainid int, ispublic bool, options DomainOptions, err error) {
 	fs.Lock()
 	defer fs.Unlock()
 	domain = strings.ToLower(domain)
 	var ispublicint int
-	domainid, _, ispublicint, err = fs.getDomainFromName(domain)
+	domainid, _, ispublicint, options, err = fs.getDomainFromName(domain)
 	if domainid == 0 {
 		err = errors.New("domain " + domain + " does not exist")
 	}
@@ -765,9 +1179,9 @@ func (fs *FileSystem) GetDomainFromName(domain string) (domainid int, ispublic b
 	return
 }
 
-func (fs *FileSystem) getDomainFromName(domain string) (domainid int, hashedPassword string, ispublic int, err error) {
+func (fs *FileSystem) getDomainFromName(domain string) (domainid int, hashedPassword string, ispublic int, options DomainOptions, err error) {
 	// prepare statement
-	query := "SELECT id,hashed_pass,ispublic FROM domains WHERE name = ?"
+	query := "SELECT id,hashed_pass,ispublic,options FROM domains WHERE name = ?"
 	stmt, err := fs.DB.Prepare(query)
 	if err != nil {
 		err = errors.Wrap(err, "preparing query: "+query)
@@ -785,12 +1199,14 @@ func (fs *FileSystem) getDomainFromName(domain string) (domainid int, hashedPass
 	defer rows.Close()
 	for rows.Next() {
 		var an_int64 sql.NullInt64
-		err = rows.Scan(&domainid, &hashedPassword, &an_int64)
+		var b []byte
+		err = rows.Scan(&domainid, &hashedPassword, &an_int64, &b)
 		if err != nil {
 			err = errors.Wrap(err, "getRows")
 			return
 		}
 		ispublic = int(an_int64.Int64)
+		json.Unmarshal(b, &options)
 	}
 	err = rows.Err()
 	if err != nil {
@@ -849,17 +1265,22 @@ func (fs *FileSystem) SetSimilar(id string, similarids []string) (err error) {
 }
 
 // GetAll returns all the files for a given domain
-func (fs *FileSystem) GetAll(domain string) (files []File, err error) {
+func (fs *FileSystem) GetAll(domain string, created ...bool) (files []File, err error) {
 	fs.Lock()
 	defer fs.Unlock()
-	files, err = fs.getAllFromPreparedQuery(`
-	SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views FROM fs 
+	q := `SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views FROM fs 
 	INNER JOIN fts ON fs.id=fts.id 
 	INNER JOIN domains ON fs.domainid=domains.id
 	WHERE 
 		domains.name = ?
 		AND LENGTH(fts.data) > 0
-	ORDER BY fs.modified DESC`, domain)
+	`
+	if len(created) > 0 && created[0] {
+		q += "ORDER BY fs.created DESC"
+	} else {
+		q += "ORDER BY fs.modified DESC"
+	}
+	files, err = fs.getAllFromPreparedQuery(q, domain)
 	for i := range files {
 		files[i].Domain = domain
 	}
@@ -868,14 +1289,10 @@ func (fs *FileSystem) GetAll(domain string) (files []File, err error) {
 
 // GetSimilar returns all the files for a given domain
 func (fs *FileSystem) GetSimilar(fileid string) (files []File, err error) {
-	fs.Lock()
-	defer fs.Unlock()
 	return fs.getAllFromPreparedQuery(`
 	SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views FROM fs 
 	INNER JOIN fts ON fs.id=fts.id 
 	WHERE 
-		LENGTH(fts.data) > 0
-	AND 
 		fs.id IN (
 			SELECT fsid_similar FROM similar WHERE fsid = ?
 		)
@@ -883,17 +1300,25 @@ func (fs *FileSystem) GetSimilar(fileid string) (files []File, err error) {
 }
 
 // GetTopX returns the info from a file
-func (fs *FileSystem) GetTopX(domain string, num int) (files []File, err error) {
+func (fs *FileSystem) GetTopX(domain string, num int, created ...bool) (files []File, err error) {
 	fs.Lock()
 	defer fs.Unlock()
-	return fs.getAllFromPreparedQuery(`
+	q := `
 	SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views FROM fs 
 	INNER JOIN fts ON fs.id=fts.id 
 	INNER JOIN domains ON fs.domainid=domains.id
 	WHERE 
 		domains.name = ?
 		AND LENGTH(fts.data) > 0
-	ORDER BY fs.modified DESC LIMIT ?`, domain, num)
+
+		`
+	if len(created) > 0 && created[0] {
+		q += "ORDER BY fs.created DESC"
+	} else {
+		q += "ORDER BY fs.modified DESC"
+	}
+	q += " LIMIT ?"
+	return fs.getAllFromPreparedQuery(q, domain, num)
 }
 
 // GetTopX returns the info from a file
@@ -918,37 +1343,35 @@ func (fs *FileSystem) Get(id string, domain string) (files []File, err error) {
 }
 
 func (fs *FileSystem) get(id string, domain string) (files []File, err error) {
-
-	files, err = fs.getAllFromPreparedQuery(`
+	haveID, err := fs.isID(id)
+	if err != nil {
+		err = errors.Wrap(err, "isID")
+		return
+	}
+	if haveID {
+		files, err = fs.getAllFromPreparedQuery(`
 		SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views FROM fs 
+		INNER JOIN fts ON fs.id=fts.id 
+		WHERE fs.id = ? LIMIT 1`, id)
+		if err != nil {
+			err = errors.Wrap(err, "get from id")
+			return
+		}
+	} else {
+		files, err = fs.getAllFromPreparedQuery(`
+		SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views
+		FROM fs 
 		INNER JOIN fts ON fs.id=fts.id 
 		INNER JOIN domains ON fs.domainid=domains.id
 		WHERE 
-			fs.id = ? 
+			fs.id IN (SELECT id FROM fs WHERE slug=?) 
 			AND
 			domains.name = ?
-		ORDER BY modified DESC`, id, domain)
-	if err != nil {
-		err = errors.Wrap(err, "get from id")
-		return
-	}
-	if len(files) > 0 {
-		return
-	}
-
-	files, err = fs.getAllFromPreparedQuery(`
-	SELECT fs.id,fs.slug,fs.created,fs.modified,fts.data,fs.history,fs.views
-	FROM fs 
-	INNER JOIN fts ON fs.id=fts.id 
-	INNER JOIN domains ON fs.domainid=domains.id
-	WHERE 
-		fs.id IN (SELECT id FROM fs WHERE slug=?) 
-		AND
-		domains.name = ?
-		ORDER BY modified DESC`, id, domain)
-	if err != nil {
-		err = errors.Wrap(err, "get from slug")
-		return
+			ORDER BY modified DESC`, id, domain)
+		if err != nil {
+			err = errors.Wrap(err, "get from slug")
+			return
+		}
 	}
 	if len(files) > 0 {
 		return
@@ -1019,38 +1442,84 @@ func (fs *FileSystem) idExists(id string) (exists bool, err error) {
 	return
 }
 
-// Exists returns whether specified id or slug exists
-func (fs *FileSystem) Exists(id string, domain string) (exists bool, err error) {
-	fs.Lock()
-	defer fs.Unlock()
-
+// isID returns whether specified ID exists exists
+func (fs *FileSystem) isID(id string) (exists bool, err error) {
 	files, err := fs.getAllFromPreparedQuerySingleString(`
-		SELECT fs.id FROM fs INNER JOIN domains ON fs.domainid=domains.id WHERE fs.id = ? AND domains.name = ?`, id, domain)
+		SELECT id FROM fs WHERE id = ?`, id)
 	if err != nil {
 		err = errors.Wrap(err, "Exists")
-		return
 	}
 	if len(files) > 0 {
 		exists = true
+	}
+	return
+}
+
+// LatestEntryFromDomainID returns the last entry date for the current domain
+func (fs *FileSystem) LatestEntryFromDomainID(domainid int) (latest time.Time, err error) {
+	if domainid == 0 {
+		err = fmt.Errorf("cannot get latest entry from public")
 		return
 	}
 
-	files, err = fs.getAllFromPreparedQuerySingleString(`
-	SELECT fs.id FROM fs 
-	INNER JOIN domains ON fs.domainid=domains.id
-	WHERE fs.slug = ? AND domains.name = ?`, id, domain)
+	timestamps, err := fs.getAllFromPreparedQuerySingleTimestamp(`
+		SELECT modified FROM fs WHERE domainid = ? AND views > 0 ORDER BY modified DESC LIMIT 1
+	`, domainid)
+	if err != nil {
+		err = errors.Wrap(err, "getAllFromPreparedQuerySingleTimestamp")
+		return
+	}
+	if len(timestamps) > 0 {
+		latest = timestamps[0]
+	} else {
+		err = fmt.Errorf("found no entries")
+	}
+	return
+}
+
+// Exists returns whether specified id or slug exists
+func (fs *FileSystem) Exists(id string, domain string) (trueID string, many bool, err error) {
+	// timeStart := time.Now().UTC()
+	// defer func() {
+	// 	log.Debugf("checked exists %s/%s in %s", domain, id, time.Since(timeStart))
+	// }()
+
+	// fs.Lock()
+	// defer fs.Unlock()
+
+	ids, err := fs.getAllFromPreparedQuerySingleString(`
+		SELECT id FROM fs WHERE id = ? AND domainid IN (SELECT id FROM domains WHERE name = ?)`, id, domain)
 	if err != nil {
 		err = errors.Wrap(err, "Exists")
 		return
 	}
-	if len(files) > 0 {
-		exists = true
+	if len(ids) > 0 {
+		trueID = ids[0]
+		return
+	}
+
+	ids, err = fs.getAllFromPreparedQuerySingleString(`
+	SELECT fs.id FROM fs WHERE fs.slug = ? AND fs.domainid IN (SELECT id FROM domains WHERE name = ?)`, id, domain)
+	if err != nil {
+		err = errors.Wrap(err, "Exists")
+		return
+	}
+	if len(ids) > 0 {
+		trueID = ids[0]
+	}
+	if len(ids) > 1 {
+		many = true
 	}
 
 	return
 }
 
 func (fs *FileSystem) getAllFromPreparedQuery(query string, args ...interface{}) (files []File, err error) {
+	// timeStart := time.Now().UTC()
+	// defer func() {
+	// 	log.Debugf("getAllFromPreparedQuery %s in %s", query, time.Since(timeStart))
+	// }()
+
 	// prepare statement
 	stmt, err := fs.DB.Prepare(query)
 	if err != nil {
@@ -1102,6 +1571,11 @@ func (fs *FileSystem) getAllFromPreparedQuery(query string, args ...interface{})
 }
 
 func (fs *FileSystem) getAllFromPreparedQuerySingleString(query string, args ...interface{}) (s []string, err error) {
+	// timeStart := time.Now().UTC()
+	// defer func() {
+	// 	log.Debugf("getAllFromPreparedQuerySingleString %s in %s", query, time.Since(timeStart))
+	// }()
+
 	// prepare statement
 	stmt, err := fs.DB.Prepare(query)
 	if err != nil {
@@ -1121,6 +1595,47 @@ func (fs *FileSystem) getAllFromPreparedQuerySingleString(query string, args ...
 	s = []string{}
 	for rows.Next() {
 		var stemp string
+		err = rows.Scan(
+			&stemp,
+		)
+		if err != nil {
+			err = errors.Wrap(err, "getRows")
+			return
+		}
+		s = append(s, stemp)
+	}
+	err = rows.Err()
+	if err != nil {
+		err = errors.Wrap(err, "getRows")
+	}
+	return
+}
+
+func (fs *FileSystem) getAllFromPreparedQuerySingleTimestamp(query string, args ...interface{}) (s []time.Time, err error) {
+	// timeStart := time.Now().UTC()
+	// defer func() {
+	// 	log.Debugf("getAllFromPreparedQuerySingleTimestamp %s in %s", query, time.Since(timeStart))
+	// }()
+
+	// prepare statement
+	stmt, err := fs.DB.Prepare(query)
+	if err != nil {
+		err = errors.Wrap(err, "preparing query: "+query)
+		return
+	}
+
+	defer stmt.Close()
+	rows, err := stmt.Query(args...)
+	if err != nil {
+		err = errors.Wrap(err, query)
+		return
+	}
+
+	// loop through rows
+	defer rows.Close()
+	s = []time.Time{}
+	for rows.Next() {
+		var stemp time.Time
 		err = rows.Scan(
 			&stemp,
 		)
