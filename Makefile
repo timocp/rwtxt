@@ -2,8 +2,8 @@ HASH=$(shell git describe --always)
 LDFLAGS=-ldflags "-s -w -X main.Version=${HASH}"
 
 prereq: 
-	go install -v github.com/tdewolff/minify/cmd/minify
-	go install -v github.com/jteeuwen/go-bindata/go-bindata
+	go install -v github.com/tdewolff/minify/cmd/minify@latest
+	go install -v github.com/jteeuwen/go-bindata/go-bindata@latest
 
 bundle:
 	rm -rf assets
@@ -28,8 +28,8 @@ run: quick
 	./rwtxt
 
 debug: 
-	go get -v --tags "fts4" ${LDFLAGS} ./...
-	$(GOPATH)/bin/rwtxt --debug
+	go build -v --tags "fts4" ${LDFLAGS} ./cmd/rwtxt
+	./rwtxt --debug
 
 dev:
 	rerun make run
