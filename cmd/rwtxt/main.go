@@ -11,6 +11,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/schollz/rwtxt"
 	"github.com/schollz/rwtxt/pkg/db"
+
+	slog "github.com/schollz/logger"
 )
 
 var (
@@ -57,9 +59,11 @@ func main() {
 	if *debug {
 		err = setLogLevel("debug")
 		db.SetLogLevel("debug")
+		slog.SetLevel("debug")
 	} else {
 		err = setLogLevel("info")
 		db.SetLogLevel("info")
+		slog.SetLevel("info")
 	}
 	if err != nil {
 		panic(err)
